@@ -135,7 +135,6 @@ async def send_photo_message(message_or_callback, photo: dict):
         )
 
 
-@Command.as_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     """دستور /start"""
     text = (
@@ -151,7 +150,6 @@ async def cmd_start(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 
-@Command.as_handler(commands=["random"])
 async def cmd_random(message: types.Message):
     """دستور /random"""
     try:
@@ -167,7 +165,6 @@ async def cmd_random(message: types.Message):
         await message.answer(f"❌ {str(e)}")
 
 
-@Command.as_handler(commands=["search"])
 async def cmd_search(message: types.Message):
     """دستور /search"""
     try:
