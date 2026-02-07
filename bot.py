@@ -1,14 +1,16 @@
 import asyncio
-import aiohttp
+import os
+import logging
 from datetime import datetime, timedelta
 from collections import deque
-import logging
-import os
+from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import aiohttp
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -16,7 +18,7 @@ class RateLimiter:
     def __init__(self):
         self.requests = deque()
     
-    def can_request(self):
+    def can_request(self) -> bool:
         now = datetime.now()
         while self.requests and (now - self.requests[0]).total_seconds() >= 3600:
             self.requests.popleft()
@@ -25,163 +27,236 @@ class RateLimiter:
     def add(self):
         self.requests.append(datetime.now())
     
-    def remaining(self):
+    def remaining(self) -> int:
         now = datetime.now()
         while self.requests and (now - self.requests[0]).total_seconds() >= 3600:
             self.requests.popleft()
         return 50 - len(self.requests)
 
 
-# Global variables
-limiter = RateLimiter()
-session = None
-unsplash_key = ""
+class UnsplashAPI:
+    def __init__(self, access_key: str):
+        self.access_key = access_key
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.limiter = RateLimiter()
+    
+    async def init(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession(
+                headers={
+                    "Authorization": f"Client-ID {self.access_key}",
+                    "Accept-Version": "v1"
+                },
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+    
+    async def close(self):
+        if self.session:
+            await self.session.close()
+    
+    async def request(self, endpoint: str, params: dict = None):
+        if not self.limiter.can_request():
+            raise Exception(f"⏳ محدودیت! باقی: {self.limiter.remaining()}/50")
+        
+        await self.init()
+        
+        url = f"https://api.unsplash.com{endpoint}"
+        async with self.session.get(url, params=params or {}) as response:
+            self.limiter.add()
+            
+            if response.status == 429:
+                raise Exception("⚠️ Rate limit reached!")
+            if response.status >= 400:
+                raise Exception(f"❌ API Error: {response.status}")
+            
+            return await response.json()
+    
+    async def get_random(self, query: str = None):
+        params = {}
+        if query:
+            params["query"] = query
+        return await self.request("/photos/random", params)
+    
+    async def search(self, query: str, per_page: int = 1):
+        params = {"query": query, "per_page": per_page}
+        return await self.request("/search/photos", params)
+    
+    async def track_download(self, download_location: str):
+        try:
+            await self.init()
+            async with self.session.get(download_location):
+                pass
+        except:
+            pass
 
 
-async def init_session():
-    global session, unsplash_key
-    if not session:
-        session = aiohttp.ClientSession(
-            headers={
-                "Authorization": f"Client-ID {unsplash_key}",
-                "Accept-Version": "v1"
-            },
-            timeout=aiohttp.ClientTimeout(total=30)
+# Global instances
+bot: Optional[Bot] = None
+unsplash: Optional[UnsplashAPI] = None
+
+
+def get_keyboard() -> InlineKeyboardMarkup:
+    """ساخت کیبورد inline"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 جدید", callback_data="refresh")
+        ]
+    ])
+
+
+async def send_photo_message(message_or_callback, photo: dict):
+    """ارسال عکس با caption"""
+    caption = (
+        f"📸 {photo.get('alt_description', 'Photo')}\n"
+        f"👤 {photo['user']['name']}\n"
+        f"🔗 [Unsplash]({photo['links']['html']}?utm_source=telegram_bot&utm_medium=referral)\n"
+        f"⚡️ باقی: {unsplash.limiter.remaining()}/50"
+    )
+    
+    # Track download
+    if photo.get("links", {}).get("download_location"):
+        await unsplash.track_download(photo["links"]["download_location"])
+    
+    # ارسال عکس
+    if isinstance(message_or_callback, types.CallbackQuery):
+        await message_or_callback.message.delete()
+        await message_or_callback.message.answer_photo(
+            photo=photo['urls']['regular'],
+            caption=caption,
+            reply_markup=get_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        await message_or_callback.answer_photo(
+            photo=photo['urls']['regular'],
+            caption=caption,
+            reply_markup=get_keyboard(),
+            parse_mode="Markdown"
         )
 
 
-async def request(endpoint, params=None):
-    if not limiter.can_request():
-        raise Exception(f"⏳ محدودیت! باقی: {limiter.remaining()}/50")
-    
-    await init_session()
-    async with session.get(f"https://api.unsplash.com{endpoint}", params=params or {}) as r:
-        limiter.add()
-        if r.status == 429:
-            raise Exception("⚠️ Rate limit!")
-        if r.status >= 400:
-            raise Exception(f"❌ API Error: {r.status}")
-        return await r.json()
-
-
-async def track_download(download_location):
-    try:
-        await init_session()
-        async with session.get(download_location):
-            pass
-    except:
-        pass
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+@Command.as_handler(commands=["start", "help"])
+async def cmd_start(message: types.Message):
+    """دستور /start"""
+    text = (
         "🌄 **Unsplash Bot**\n\n"
-        "📝 `/random` - عکس تصادفی\n"
-        "📝 `/search ocean` - جستجو\n"
-        f"⚡️ باقی: {limiter.remaining()}/50",
-        parse_mode='Markdown'
+        "📝 **دستورات:**\n"
+        "• `/random` - عکس تصادفی\n"
+        "• `/random nature` - با موضوع\n"
+        "• `/search ocean` - جستجو\n\n"
+        "💡 **در چت خصوصی:**\n"
+        "فقط بنویس: `mountain`\n\n"
+        f"⚡️ باقی: {unsplash.limiter.remaining()}/50"
     )
+    await message.answer(text, parse_mode="Markdown")
 
 
-async def random_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    params = {}
-    if context.args:
-        params["query"] = " ".join(context.args)
-    
+@Command.as_handler(commands=["random"])
+async def cmd_random(message: types.Message):
+    """دستور /random"""
     try:
-        photo = await request("/photos/random", params)
-        await send_photo(update, photo)
+        # استخراج query از دستور
+        query = None
+        if message.text and len(message.text.split()) > 1:
+            query = " ".join(message.text.split()[1:])
+        
+        photo = await unsplash.get_random(query)
+        await send_photo_message(message, photo)
+    
     except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+        await message.answer(f"❌ {str(e)}")
 
 
-async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ مثال: `/search ocean`", parse_mode='Markdown')
+@Command.as_handler(commands=["search"])
+async def cmd_search(message: types.Message):
+    """دستور /search"""
+    try:
+        # استخراج query
+        if not message.text or len(message.text.split()) < 2:
+            await message.answer("❌ مثال: `/search ocean`", parse_mode="Markdown")
+            return
+        
+        query = " ".join(message.text.split()[1:])
+        result = await unsplash.search(query)
+        
+        if result.get("results"):
+            await send_photo_message(message, result["results"][0])
+        else:
+            await message.answer("❌ نتیجه‌ای نیست")
+    
+    except Exception as e:
+        await message.answer(f"❌ {str(e)}")
+
+
+async def handle_text(message: types.Message):
+    """هندلر پیام‌های متنی (فقط چت خصوصی)"""
+    # فقط در چت خصوصی
+    if message.chat.type != "private":
         return
     
-    query = " ".join(context.args)
-    try:
-        result = await request("/search/photos", {"query": query, "per_page": 1})
-        if result.get("results"):
-            await send_photo(update, result["results"][0])
-        else:
-            await update.message.reply_text("❌ نتیجه‌ای نیست")
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip()
+    query = message.text.strip()
     if not query:
         return
     
     try:
-        result = await request("/search/photos", {"query": query, "per_page": 1})
+        result = await unsplash.search(query)
+        
         if result.get("results"):
-            await send_photo(update, result["results"][0])
+            await send_photo_message(message, result["results"][0])
         else:
-            await update.message.reply_text("❌ نتیجه‌ای نیست")
+            await message.answer("❌ نتیجه‌ای نیست")
+    
     except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+        await message.answer(f"❌ {str(e)}")
 
 
-async def send_photo(update: Update, photo):
-    caption = (
-        f"📸 {photo.get('alt_description', 'Photo')}\n"
-        f"👤 {photo['user']['name']}\n"
-        f"⚡️ {limiter.remaining()}/50"
-    )
+async def handle_refresh(callback: types.CallbackQuery):
+    """هندلر دکمه refresh"""
+    try:
+        await callback.answer()
+        photo = await unsplash.get_random()
+        await send_photo_message(callback, photo)
     
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄", callback_data="refresh"),
-        InlineKeyboardButton("📸 Unsplash", url=photo['links']['html'])
-    ]])
-    
-    if photo.get("links", {}).get("download_location"):
-        await track_download(photo["links"]["download_location"])
-    
-    await update.effective_chat.send_photo(
-        photo['urls']['regular'],
-        caption=caption,
-        reply_markup=keyboard
-    )
+    except Exception as e:
+        await callback.message.answer(f"❌ {str(e)}")
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def main():
+    global bot, unsplash
     
-    if query.data == "refresh":
-        try:
-            photo = await request("/photos/random")
-            await query.message.delete()
-            await send_photo(update, photo)
-        except Exception as e:
-            await query.message.reply_text(f"❌ {e}")
-
-
-def main():
-    global unsplash_key
-    
+    # دریافت توکن‌ها
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    unsplash_key = os.getenv("UNSPLASH_KEY")
+    UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
     
-    if not TELEGRAM_TOKEN or not unsplash_key:
-        logger.error("❌ توکن‌ها رو تنظیم کنید!")
+    if not TELEGRAM_TOKEN or not UNSPLASH_KEY:
+        logger.error("❌ لطفاً TELEGRAM_TOKEN و UNSPLASH_KEY را تنظیم کنید!")
         return
     
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # ساخت bot و unsplash
+    bot = Bot(token=TELEGRAM_TOKEN)
+    unsplash = UnsplashAPI(UNSPLASH_KEY)
     
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("random", random_cmd))
-    app.add_handler(CommandHandler("search", search_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_handler))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    # ساخت dispatcher
+    dp = Dispatcher()
     
-    logger.info("✅ ربات شروع شد")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ثبت handlers
+    dp.message.register(cmd_start, Command(commands=["start", "help"]))
+    dp.message.register(cmd_random, Command(commands=["random"]))
+    dp.message.register(cmd_search, Command(commands=["search"]))
+    dp.message.register(handle_text, F.text)
+    dp.callback_query.register(handle_refresh, F.data == "refresh")
+    
+    try:
+        logger.info("✅ ربات شروع شد")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    
+    finally:
+        await unsplash.close()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 ربات متوقف شد")
